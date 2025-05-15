@@ -117,11 +117,9 @@ Total fields: 25 (Referenced: 20, Not referenced: 5)
 
 ## License / ライセンス
 
-[Add license information here / ここにライセンス情報を追加]
+This project is licensed under the MIT License.
 
-## Contributing / 貢献
-
-[Add contribution guidelines here / ここに貢献ガイドラインを追加]
+このプロジェクトはMITライセンスの下で提供されています。
 
 ## Acknowledgments / 謝辞
 
