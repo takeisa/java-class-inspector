@@ -21,176 +21,508 @@ import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 
 /**
- * A CLI application that analyzes class files in a specified JAR file
- * and detects whether methods and fields are referenced by any class, including the class itself.
+ * A CLI application that lists all class files in a specified JAR file
+ * and displays their field names and method names using ASM.
+ * Can also identify unreferenced classes and members.
  */
 public class Main {
 
-    // Data structures to store class information and references
-    private static final Map<String, ClassInfo> classInfoMap = new HashMap<>();
-    private static final Map<String, Set<String>> methodReferences = new HashMap<>();
-    private static final Map<String, Set<String>> fieldReferences = new HashMap<>();
-
     /**
-     * Represents information about a class, including its methods and fields.
+     * Represents information about a class, including its fields and methods.
      */
     private static class ClassInfo {
         String className;
-        Set<String> methods = new HashSet<>();
+        String superClassName;  // Store the superclass name
         Set<String> fields = new HashSet<>();
+        Set<String> methods = new HashSet<>();
+        boolean isReferenced = false;
+
+        // Track which fields and methods are referenced
+        Set<String> referencedFields = new HashSet<>();
+        Set<String> referencedMethods = new HashSet<>();
 
         public ClassInfo(String className) {
             this.className = className;
         }
 
-        public void addMethod(String methodName, String descriptor) {
-            methods.add(methodName + descriptor);
+        public void addField(String fieldName, String descriptor) {
+            fields.add(fieldName + " " + descriptor);
         }
 
-        public void addField(String fieldName, String descriptor) {
-            fields.add(fieldName + ":" + descriptor);
+        public void addMethod(String methodName, String descriptor) {
+            methods.add(methodName + " " + descriptor);
+        }
+
+        public Set<String> getUnreferencedFields() {
+            Set<String> unreferenced = new HashSet<>(fields);
+            unreferenced.removeAll(referencedFields);
+            return unreferenced;
+        }
+
+        public Set<String> getUnreferencedMethods() {
+            Set<String> unreferenced = new HashSet<>(methods);
+            unreferenced.removeAll(referencedMethods);
+            // Don't remove constructors and static initializers to ensure consistency with non-u mode
+            return unreferenced;
         }
     }
 
     /**
-     * A ClassVisitor implementation that collects information about classes, methods, and fields.
+     * A ClassVisitor implementation that collects information about classes, fields, and methods.
      */
     private static class ClassInfoCollector extends ClassVisitor {
-        private String className;
-        private ClassInfo classInfo;
-        private String superName;
+        private ClassInfo currentClass;
+        private final Map<String, ClassInfo> classInfoMap;
 
-        public ClassInfoCollector() {
+        public ClassInfoCollector(Map<String, ClassInfo> classInfoMap) {
             super(Opcodes.ASM9);
+            this.classInfoMap = classInfoMap;
         }
 
         @Override
         public void visit(int version, int access, String name, String signature, 
                           String superName, String[] interfaces) {
-            this.className = name.replace('/', '.');
-            this.classInfo = new ClassInfo(className);
-            this.superName = superName != null ? superName.replace('/', '.') : null;
-            classInfoMap.put(className, classInfo);
+            String className = name.replace('/', '.');
+            currentClass = new ClassInfo(className);
+            if (superName != null) {
+                currentClass.superClassName = superName.replace('/', '.');
+            }
+            classInfoMap.put(className, currentClass);
         }
 
         @Override
         public FieldVisitor visitField(int access, String name, String descriptor, 
                                       String signature, Object value) {
-            // Skip private fields as they can't be referenced from outside
-            if ((access & Opcodes.ACC_PRIVATE) == 0) {
-                classInfo.addField(name, descriptor);
-            }
+            currentClass.addField(name, descriptor);
             return null;
         }
 
         @Override
         public MethodVisitor visitMethod(int access, String name, String descriptor, 
                                         String signature, String[] exceptions) {
-            // Skip private methods as they can't be referenced from outside
-            if ((access & Opcodes.ACC_PRIVATE) == 0) {
-                classInfo.addMethod(name, descriptor);
+            // Only add methods that are actually defined in this class, not inherited ones
+            // Bridge and synthetic methods are generated by the compiler, not directly defined in the source code
+            if ((access & (Opcodes.ACC_BRIDGE | Opcodes.ACC_SYNTHETIC)) == 0) {
+                currentClass.addMethod(name, descriptor);
             }
             return null;
         }
     }
 
     /**
-     * A ClassVisitor implementation that detects references to methods and fields from any class, including the class itself.
+     * A MethodVisitor implementation that detects references to other classes, fields, and methods.
+     */
+    private static class MethodReferenceVisitor extends MethodVisitor {
+        private final ReferenceDetector detector;
+
+        public MethodReferenceVisitor(ReferenceDetector detector) {
+            super(Opcodes.ASM9);
+            this.detector = detector;
+        }
+
+        @Override
+        public void visitFieldInsn(int opcode, String owner, String name, String descriptor) {
+            detector.addFieldReference(owner.replace('/', '.'), name, descriptor);
+        }
+
+        @Override
+        public void visitMethodInsn(int opcode, String owner, String name, String descriptor, boolean isInterface) {
+            detector.addMethodReference(owner.replace('/', '.'), name, descriptor);
+        }
+
+        @Override
+        public void visitTypeInsn(int opcode, String type) {
+            if (type.startsWith("[")) {
+                // Handle array types
+                Type t = Type.getType(type);
+                if (t.getSort() == Type.OBJECT) {
+                    detector.addClassReference(t.getClassName());
+                }
+            } else {
+                detector.addClassReference(type.replace('/', '.'));
+            }
+        }
+    }
+
+    /**
+     * A ClassVisitor implementation that detects references to other classes, fields, and methods.
      */
     private static class ReferenceDetector extends ClassVisitor {
-        private String className;
-        private String superName;
-        private String[] interfaces;
+        private final Map<String, ClassInfo> classInfoMap;
+        private String currentClassName;
 
-        public ReferenceDetector() {
+        public ReferenceDetector(Map<String, ClassInfo> classInfoMap) {
             super(Opcodes.ASM9);
+            this.classInfoMap = classInfoMap;
+        }
+
+        @Override
+        public void visit(int version, int access, String name, String signature, 
+                          String superName, String[] interfaces) {
+            currentClassName = name.replace('/', '.');
+
+            // Mark superclass as referenced
+            if (superName != null) {
+                addClassReference(superName.replace('/', '.'));
+            }
+
+            // Mark interfaces as referenced
+            if (interfaces != null) {
+                for (String iface : interfaces) {
+                    addClassReference(iface.replace('/', '.'));
+                }
+            }
+        }
+
+        @Override
+        public MethodVisitor visitMethod(int access, String name, String descriptor, 
+                                        String signature, String[] exceptions) {
+            // Process parameter and return types
+            Type methodType = Type.getMethodType(descriptor);
+            Type returnType = methodType.getReturnType();
+            if (returnType.getSort() == Type.OBJECT) {
+                addClassReference(returnType.getClassName());
+            }
+
+            for (Type paramType : methodType.getArgumentTypes()) {
+                if (paramType.getSort() == Type.OBJECT) {
+                    addClassReference(paramType.getClassName());
+                }
+            }
+
+            return new MethodReferenceVisitor(this);
+        }
+
+        public void addClassReference(String className) {
+            ClassInfo info = classInfoMap.get(className);
+            if (info != null) {
+                info.isReferenced = true;
+            }
+        }
+
+        public void addFieldReference(String className, String fieldName, String descriptor) {
+            ClassInfo info = classInfoMap.get(className);
+            if (info != null) {
+                info.referencedFields.add(fieldName + " " + descriptor);
+            }
+        }
+
+        public void addMethodReference(String className, String methodName, String descriptor) {
+            ClassInfo info = classInfoMap.get(className);
+            if (info != null) {
+                String methodKey = methodName + " " + descriptor;
+
+                // Check if the method exists in this class
+                if (info.methods.contains(methodKey)) {
+                    // Method exists in this class, mark it as referenced
+                    info.referencedMethods.add(methodKey);
+                } else {
+                    // Method doesn't exist in this class, check parent classes
+                    markMethodInParentClass(className, methodKey);
+                }
+            }
+        }
+
+        private void markMethodInParentClass(String className, String methodKey) {
+            // Get the class info
+            ClassInfo classInfo = classInfoMap.get(className);
+            if (classInfo == null) return;
+
+            // Check if this class has a superclass
+            if (classInfo.superClassName != null) {
+                // Get the superclass info
+                ClassInfo superClassInfo = classInfoMap.get(classInfo.superClassName);
+                if (superClassInfo != null) {
+                    // Check if the method exists in the superclass
+                    if (superClassInfo.methods.contains(methodKey)) {
+                        // Found the method in the parent class, mark it as referenced
+                        superClassInfo.referencedMethods.add(methodKey);
+                        return;
+                    } else {
+                        // Continue searching in the parent's hierarchy
+                        markMethodInParentClass(classInfo.superClassName, methodKey);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * A ClassVisitor implementation that extracts and prints field and method information.
+     */
+    private static class ClassInspectorVisitor extends ClassVisitor {
+        private String className;
+        private String superClassName;
+        private final boolean showOnlyUnreferenced;
+        private final Map<String, ClassInfo> classInfoMap;
+        private int referencedMethodCount = 0;
+        private int unreferencedMethodCount = 0;
+        private int referencedFieldCount = 0;
+        private int unreferencedFieldCount = 0;
+        private List<String> methodsInfo = new ArrayList<>();
+        private List<String> fieldsInfo = new ArrayList<>();
+        private boolean printedMethodsHeader = false;
+
+        public ClassInspectorVisitor(boolean showOnlyUnreferenced, Map<String, ClassInfo> classInfoMap) {
+            super(Opcodes.ASM9);
+            this.showOnlyUnreferenced = showOnlyUnreferenced;
+            this.classInfoMap = classInfoMap;
         }
 
         @Override
         public void visit(int version, int access, String name, String signature, 
                           String superName, String[] interfaces) {
             this.className = name.replace('/', '.');
-            this.superName = superName != null ? superName.replace('/', '.') : null;
+            this.superClassName = superName != null ? superName.replace('/', '.') : null;
 
-            if (interfaces != null) {
-                this.interfaces = new String[interfaces.length];
-                for (int i = 0; i < interfaces.length; i++) {
-                    this.interfaces[i] = interfaces[i].replace('/', '.');
-                }
-            } else {
-                this.interfaces = new String[0];
+            ClassInfo classInfo = classInfoMap.get(className);
+
+            // Skip referenced classes if we're only showing unreferenced items
+            if (showOnlyUnreferenced && classInfo != null && classInfo.isReferenced) {
+                return;
             }
+
+            String typePrefix = (access & Opcodes.ACC_INTERFACE) != 0 ? "Interface: " : "Class: ";
+            System.out.println("\n" + typePrefix + className + 
+                (showOnlyUnreferenced && classInfo != null ? " (unreferenced)" : ""));
+            System.out.println("--------------------------------------------------------------------------------");
+
+            if (superName != null && !showOnlyUnreferenced) {
+                System.out.println("  Superclass: " + superClassName);
+            }
+        }
+
+        @Override
+        public FieldVisitor visitField(int access, String name, String descriptor, 
+                                      String signature, Object value) {
+            ClassInfo classInfo = classInfoMap.get(className);
+            String fieldKey = name + " " + descriptor;
+
+            if (showOnlyUnreferenced) {
+                if (classInfo != null && !classInfo.getUnreferencedFields().contains(fieldKey)) {
+                    return null;
+                }
+                System.out.println("  Field: " + name + " " + descriptor);
+            } else {
+                boolean isReferenced = classInfo != null && classInfo.referencedFields.contains(fieldKey);
+
+                if (isReferenced) {
+                    referencedFieldCount++;
+                } else {
+                    unreferencedFieldCount++;
+                }
+
+                // Store field info for later display
+                StringBuilder info = new StringBuilder();
+                info.append("    ").append(isReferenced ? "✓" : "✗").append(" ").append(name).append(": ");
+
+                // Convert field descriptor to simple type name
+                Type fieldType = Type.getType(descriptor);
+                info.append(getSimpleTypeName(fieldType));
+
+                fieldsInfo.add(info.toString());
+
+                // Add reference information
+                if (isReferenced) {
+                    StringBuilder refInfo = new StringBuilder();
+                    refInfo.append("      Referenced by: ");
+                    // Find classes that reference this field
+                    boolean foundReference = false;
+                    for (Map.Entry<String, ClassInfo> entry : classInfoMap.entrySet()) {
+                        if (entry.getValue().referencedFields.contains(fieldKey)) {
+                            if (foundReference) {
+                                refInfo.append(", ");
+                            }
+                            refInfo.append(entry.getKey());
+                            foundReference = true;
+                        }
+                    }
+                    fieldsInfo.add(refInfo.toString());
+                } else {
+                    fieldsInfo.add("      Not referenced by any class");
+                }
+            }
+
+            return null;
         }
 
         @Override
         public MethodVisitor visitMethod(int access, String name, String descriptor, 
                                         String signature, String[] exceptions) {
-            return new MethodReferenceVisitor(className, superName, interfaces);
-        }
-    }
+            ClassInfo classInfo = classInfoMap.get(className);
+            String methodKey = name + " " + descriptor;
 
-    /**
-     * A MethodVisitor implementation that detects references to methods and fields from any class, including the class itself.
-     */
-    private static class MethodReferenceVisitor extends MethodVisitor {
-        private final String className;
-        private final String superName;
-        private final String[] interfaces;
+            // Skip methods that are not defined in this class (inherited methods)
+            // Check if the method is actually defined in this class by checking if it's in the methods set
+            if (!classInfo.methods.contains(methodKey)) {
+                return null;
+            }
 
-        public MethodReferenceVisitor(String className, String superName, String[] interfaces) {
-            super(Opcodes.ASM9);
-            this.className = className;
-            this.superName = superName;
-            this.interfaces = interfaces;
+            // When using -u option, we need to check if the method is actually defined in this class
+            // or if it's inherited from a parent class
+            if (showOnlyUnreferenced) {
+                // Check if the method is unreferenced
+                if (classInfo != null && !classInfo.getUnreferencedMethods().contains(methodKey)) {
+                    return null;
+                }
+
+                // Check if the method is actually defined in this class or inherited from a parent class
+                // If the method exists in the parent class, it's an inherited method
+                if (superClassName != null) {
+                    ClassInfo superClassInfo = classInfoMap.get(superClassName);
+                    if (superClassInfo != null && superClassInfo.methods.contains(methodKey)) {
+                        // This method is defined in the parent class, so skip it
+                        return null;
+                    }
+                }
+
+                System.out.println("  Method: " + name + " " + descriptor);
+            } else {
+                boolean isReferenced = classInfo != null && classInfo.referencedMethods.contains(methodKey);
+
+                if (isReferenced) {
+                    referencedMethodCount++;
+                } else {
+                    unreferencedMethodCount++;
+                }
+
+                // Store method info for later display
+                StringBuilder info = new StringBuilder();
+                info.append("    ").append(isReferenced ? "✓" : "✗").append(" ").append(name);
+
+                // Format method parameters and return type
+                Type methodType = Type.getMethodType(descriptor);
+                Type[] paramTypes = methodType.getArgumentTypes();
+                Type returnType = methodType.getReturnType();
+
+                // Format parameters
+                StringBuilder params = new StringBuilder();
+                params.append("(");
+                for (int i = 0; i < paramTypes.length; i++) {
+                    if (i > 0) {
+                        params.append(", ");
+                    }
+                    params.append(getSimpleTypeName(paramTypes[i]));
+                }
+                params.append(")");
+
+                // Format return type
+                String returnTypeStr = getSimpleTypeName(returnType);
+
+                info.append(params).append(": ").append(returnTypeStr);
+                methodsInfo.add(info.toString());
+
+                // Add reference information
+                if (isReferenced) {
+                    StringBuilder refInfo = new StringBuilder();
+                    refInfo.append("      Referenced by: ");
+                    // Find classes that reference this method
+                    boolean foundReference = false;
+                    for (Map.Entry<String, ClassInfo> entry : classInfoMap.entrySet()) {
+                        if (entry.getValue().referencedMethods.contains(methodKey)) {
+                            if (foundReference) {
+                                refInfo.append(", ");
+                            }
+                            refInfo.append(entry.getKey());
+                            foundReference = true;
+                        }
+                    }
+                    methodsInfo.add(refInfo.toString());
+                } else {
+                    methodsInfo.add("      Not referenced by any class");
+                }
+            }
+
+            return null;
         }
 
         @Override
-        public void visitMethodInsn(int opcode, String owner, String name, String descriptor, boolean isInterface) {
-            String ownerClass = owner.replace('/', '.');
+        public void visitEnd() {
+            if (!showOnlyUnreferenced && !methodsInfo.isEmpty()) {
+                System.out.println("  Methods:");
+                for (String info : methodsInfo) {
+                    System.out.println(info);
+                }
+                System.out.println("  Summary: " + referencedMethodCount + " methods referenced, " + 
+                                  unreferencedMethodCount + " methods not referenced");
+            }
 
-            // Skip java.lang.Object methods and constructors
-            if (!ownerClass.equals("java.lang.Object") && 
-                !name.equals("<init>") && 
-                !name.equals("<clinit>")) {
-
-                // Check if the method exists in the target class
-                String methodKey = ownerClass + "#" + name + descriptor;
-                methodReferences.computeIfAbsent(methodKey, k -> new HashSet<>()).add(className);
+            if (!showOnlyUnreferenced && !fieldsInfo.isEmpty()) {
+                System.out.println("  Fields:");
+                for (String info : fieldsInfo) {
+                    System.out.println(info);
+                }
+                System.out.println("  Summary: " + referencedFieldCount + " fields referenced, " + 
+                                  unreferencedFieldCount + " fields not referenced");
             }
         }
 
-        @Override
-        public void visitFieldInsn(int opcode, String owner, String name, String descriptor) {
-            String ownerClass = owner.replace('/', '.');
-
-            // Skip references to java.lang.Object fields
-            if (!ownerClass.equals("java.lang.Object")) {
-                String fieldKey = ownerClass + "#" + name + ":" + descriptor;
-                fieldReferences.computeIfAbsent(fieldKey, k -> new HashSet<>()).add(className);
+        /**
+         * Converts an ASM Type object to a simple type name.
+         * 
+         * @param type The ASM Type object
+         * @return A simple string representation of the type
+         */
+        private String getSimpleTypeName(Type type) {
+            switch (type.getSort()) {
+                case Type.VOID:
+                    return "void";
+                case Type.BOOLEAN:
+                    return "boolean";
+                case Type.CHAR:
+                    return "char";
+                case Type.BYTE:
+                    return "byte";
+                case Type.SHORT:
+                    return "short";
+                case Type.INT:
+                    return "int";
+                case Type.FLOAT:
+                    return "float";
+                case Type.LONG:
+                    return "long";
+                case Type.DOUBLE:
+                    return "double";
+                case Type.ARRAY:
+                    return getSimpleTypeName(type.getElementType()) + "[]";
+                case Type.OBJECT:
+                    String className = type.getClassName();
+                    // Remove package name for common packages
+                    if (className.startsWith("java.lang.")) {
+                        className = className.substring("java.lang.".length());
+                    }
+                    // Get simple name for other classes
+                    int lastDot = className.lastIndexOf('.');
+                    if (lastDot > 0) {
+                        className = className.substring(lastDot + 1);
+                    }
+                    return className;
+                default:
+                    return type.getClassName();
             }
-        }
-
-        @Override
-        public void visitTypeInsn(int opcode, String type) {
-            // Track instantiation of classes (new operator)
-            if (opcode == Opcodes.NEW) {
-                String typeName = type.replace('/', '.');
-                // Consider constructor reference as a method reference
-                String methodKey = typeName + "#<init>()V";
-                methodReferences.computeIfAbsent(methodKey, k -> new HashSet<>()).add(className);
-            }
-            super.visitTypeInsn(opcode, type);
         }
     }
     public static void main(String[] args) {
-        if (args.length < 1) {
-            System.err.println("Usage: java -jar class-inspector.jar <path-to-jar-file> [<path-to-jar-file> ...]");
+        boolean showOnlyUnreferenced = false;
+        List<String> jarPaths = new ArrayList<>();
+
+        // Parse command line arguments
+        for (String arg : args) {
+            if (arg.equals("--unreferenced") || arg.equals("-u")) {
+                showOnlyUnreferenced = true;
+            } else {
+                jarPaths.add(arg);
+            }
+        }
+
+        if (jarPaths.isEmpty()) {
+            System.err.println("Usage: java -jar class-inspector.jar [--unreferenced|-u] <path-to-jar-file> [<path-to-jar-file> ...]");
             System.exit(1);
         }
 
         boolean hasErrors = false;
 
-        for (String jarPath : args) {
+        for (String jarPath : jarPaths) {
             File jarFile = new File(jarPath);
 
             if (!jarFile.exists() || !jarFile.isFile()) {
@@ -200,14 +532,7 @@ public class Main {
             }
 
             try {
-                // First pass: collect information about all classes, methods, and fields
-                collectClassInfo(jarPath);
-
-                // Second pass: detect references between classes
-                detectReferences(jarPath);
-
-                // Print results
-                printResults(jarPath);
+                listClassesInJar(jarPath, showOnlyUnreferenced);
             } catch (IOException e) {
                 System.err.println("Error reading JAR file " + jarPath + ": " + e.getMessage());
                 hasErrors = true;
@@ -220,14 +545,28 @@ public class Main {
     }
 
     /**
-     * Collects information about all classes, methods, and fields in the specified JAR file.
+     * Lists all class files in the specified JAR file and inspects their fields and methods using ASM.
+     * Can also identify unreferenced classes and members.
      *
      * @param jarPath Path to the JAR file
+     * @param showOnlyUnreferenced Whether to show only unreferenced classes and members
      * @throws IOException If there's an error reading the JAR file
      */
-    private static void collectClassInfo(String jarPath) throws IOException {
+    private static void listClassesInJar(String jarPath, boolean showOnlyUnreferenced) throws IOException {
         try (JarFile jar = new JarFile(jarPath)) {
-            System.out.println("Collecting class information from " + jarPath + "...");
+            System.out.println("Inspecting classes in " + jarPath + ":" + 
+                (showOnlyUnreferenced ? " (showing only unreferenced items)" : ""));
+
+            // Step 1: Collect information about all classes, fields, and methods
+            Map<String, ClassInfo> classInfoMap = new HashMap<>();
+            List<byte[]> classBytes = new ArrayList<>();
+
+            // For overall statistics
+            int totalClasses = 0;
+            int totalMethods = 0;
+            int totalReferencedMethods = 0;
+            int totalFields = 0;
+            int totalReferencedFields = 0;
 
             Enumeration<JarEntry> entries = jar.entries();
             while (entries.hasMoreElements()) {
@@ -237,31 +576,32 @@ public class Main {
                 // Only process .class files and skip directories
                 if (name.endsWith(".class") && !entry.isDirectory()) {
                     try (InputStream is = jar.getInputStream(entry)) {
-                        // Use ASM to read the class file
-                        ClassReader reader = new ClassReader(is);
-                        ClassInfoCollector collector = new ClassInfoCollector();
+                        byte[] bytes = is.readAllBytes();
+                        classBytes.add(bytes);
 
-                        // Accept the visitor to collect class information
+                        // Collect class info
+                        ClassReader reader = new ClassReader(bytes);
+                        ClassInfoCollector collector = new ClassInfoCollector(classInfoMap);
                         reader.accept(collector, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
                     } catch (Exception e) {
-                        System.err.println("Error collecting information from class " + name + ": " + e.getMessage());
+                        System.err.println("Error collecting class info for " + name + ": " + e.getMessage());
                     }
                 }
             }
-        }
-    }
 
-    /**
-     * Detects references to methods and fields between classes in the specified JAR file.
-     *
-     * @param jarPath Path to the JAR file
-     * @throws IOException If there's an error reading the JAR file
-     */
-    private static void detectReferences(String jarPath) throws IOException {
-        try (JarFile jar = new JarFile(jarPath)) {
-            System.out.println("Detecting references between classes in " + jarPath + "...");
+            // Step 2: Detect references between classes, fields, and methods
+            for (byte[] bytes : classBytes) {
+                try {
+                    ClassReader reader = new ClassReader(bytes);
+                    ReferenceDetector detector = new ReferenceDetector(classInfoMap);
+                    reader.accept(detector, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+                } catch (Exception e) {
+                    System.err.println("Error detecting references: " + e.getMessage());
+                }
+            }
 
-            Enumeration<JarEntry> entries = jar.entries();
+            // Step 3: Display the results
+            entries = jar.entries();
             while (entries.hasMoreElements()) {
                 JarEntry entry = entries.nextElement();
                 String name = entry.getName();
@@ -271,235 +611,37 @@ public class Main {
                     try (InputStream is = jar.getInputStream(entry)) {
                         // Use ASM to read the class file
                         ClassReader reader = new ClassReader(is);
-                        ReferenceDetector detector = new ReferenceDetector();
+                        ClassInspectorVisitor visitor = new ClassInspectorVisitor(showOnlyUnreferenced, classInfoMap);
 
-                        // Accept the visitor to detect references
-                        reader.accept(detector, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+                        // Accept the visitor to extract and display field and method information
+                        reader.accept(visitor, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+
+                        // Count this class for statistics
+                        totalClasses++;
                     } catch (Exception e) {
-                        System.err.println("Error detecting references in class " + name + ": " + e.getMessage());
+                        System.err.println("Error inspecting class " + name + ": " + e.getMessage());
                     }
                 }
             }
-        }
-    }
 
-    /**
-     * Prints the results of the analysis, showing which methods and fields are referenced by other classes.
-     *
-     * @param jarPath Path to the JAR file
-     */
-    private static void printResults(String jarPath) {
-        System.out.println("\nResults for " + jarPath + ":");
-        System.out.println("=".repeat(80));
-
-        // Process each class
-        for (ClassInfo classInfo : classInfoMap.values()) {
-            // Skip java.* and javax.* classes to reduce noise
-            if (classInfo.className.startsWith("java.") || classInfo.className.startsWith("javax.")) {
-                continue;
+            // Calculate overall statistics
+            for (ClassInfo classInfo : classInfoMap.values()) {
+                totalMethods += classInfo.methods.size();
+                totalFields += classInfo.fields.size();
+                totalReferencedMethods += classInfo.referencedMethods.size();
+                totalReferencedFields += classInfo.referencedFields.size();
             }
 
-            System.out.println("\nClass: " + classInfo.className);
-            System.out.println("-".repeat(80));
-
-            // Check methods
-            if (!classInfo.methods.isEmpty()) {
-                System.out.println("  Methods:");
-
-                int referencedCount = 0;
-                int unreferencedCount = 0;
-
-                for (String method : classInfo.methods) {
-                    String methodKey = classInfo.className + "#" + method;
-                    Set<String> referencingClasses = methodReferences.get(methodKey);
-
-                    if (referencingClasses != null && !referencingClasses.isEmpty()) {
-                        referencedCount++;
-                        // Format method name and descriptor for better readability
-                        String formattedMethod = formatMethod(method);
-                        System.out.println("    ✓ " + formattedMethod);
-                        System.out.println("      Referenced by: " + formatReferencingClasses(referencingClasses));
-                    } else {
-                        unreferencedCount++;
-                        // Format method name and descriptor for better readability
-                        String formattedMethod = formatMethod(method);
-                        System.out.println("    ✗ " + formattedMethod);
-                        System.out.println("      Not referenced by any class");
-                    }
-                }
-
-                System.out.println("  Summary: " + referencedCount + " methods referenced, " + 
-                                  unreferencedCount + " methods not referenced");
-            } else {
-                System.out.println("  No public/protected methods found");
-            }
-
-            // Check fields
-            if (!classInfo.fields.isEmpty()) {
-                System.out.println("  Fields:");
-
-                int referencedCount = 0;
-                int unreferencedCount = 0;
-
-                for (String field : classInfo.fields) {
-                    String fieldKey = classInfo.className + "#" + field;
-                    Set<String> referencingClasses = fieldReferences.get(fieldKey);
-
-                    if (referencingClasses != null && !referencingClasses.isEmpty()) {
-                        referencedCount++;
-                        // Format field name and descriptor for better readability
-                        String formattedField = formatField(field);
-                        System.out.println("    ✓ " + formattedField);
-                        System.out.println("      Referenced by: " + formatReferencingClasses(referencingClasses));
-                    } else {
-                        unreferencedCount++;
-                        // Format field name and descriptor for better readability
-                        String formattedField = formatField(field);
-                        System.out.println("    ✗ " + formattedField);
-                        System.out.println("      Not referenced by any class");
-                    }
-                }
-
-                System.out.println("  Summary: " + referencedCount + " fields referenced, " + 
-                                  unreferencedCount + " fields not referenced");
-            } else {
-                System.out.println("  No public/protected fields found");
-            }
-        }
-
-        // Print overall statistics
-        int totalClasses = classInfoMap.size();
-        int totalMethods = 0;
-        int totalFields = 0;
-        int referencedMethods = 0;
-        int referencedFields = 0;
-
-        for (ClassInfo classInfo : classInfoMap.values()) {
-            totalMethods += classInfo.methods.size();
-            totalFields += classInfo.fields.size();
-
-            for (String method : classInfo.methods) {
-                String methodKey = classInfo.className + "#" + method;
-                Set<String> referencingClasses = methodReferences.get(methodKey);
-                if (referencingClasses != null && !referencingClasses.isEmpty()) {
-                    referencedMethods++;
-                }
-            }
-
-            for (String field : classInfo.fields) {
-                String fieldKey = classInfo.className + "#" + field;
-                Set<String> referencingClasses = fieldReferences.get(fieldKey);
-                if (referencingClasses != null && !referencingClasses.isEmpty()) {
-                    referencedFields++;
-                }
-            }
-        }
-
-        System.out.println("\nOverall Statistics:");
-        System.out.println("=".repeat(80));
-        System.out.println("Total classes: " + totalClasses);
-        System.out.println("Total methods: " + totalMethods + " (Referenced: " + referencedMethods + 
-                          ", Not referenced: " + (totalMethods - referencedMethods) + ")");
-        System.out.println("Total fields: " + totalFields + " (Referenced: " + referencedFields + 
-                          ", Not referenced: " + (totalFields - referencedFields) + ")");
-
-        // Clear data structures for the next JAR file
-        classInfoMap.clear();
-        methodReferences.clear();
-        fieldReferences.clear();
-    }
-
-    /**
-     * Formats a method name and descriptor for better readability.
-     *
-     * @param methodNameAndDescriptor Method name and descriptor in the format "name(descriptor)"
-     * @return Formatted method name and descriptor
-     */
-    private static String formatMethod(String methodNameAndDescriptor) {
-        int descriptorStart = methodNameAndDescriptor.indexOf('(');
-        if (descriptorStart == -1) {
-            return methodNameAndDescriptor;
-        }
-
-        String name = methodNameAndDescriptor.substring(0, descriptorStart);
-        String descriptor = methodNameAndDescriptor.substring(descriptorStart);
-
-        // Try to convert the descriptor to a more readable format
-        try {
-            Type methodType = Type.getMethodType(descriptor);
-            Type returnType = methodType.getReturnType();
-            Type[] argumentTypes = methodType.getArgumentTypes();
-
-            StringBuilder formattedDescriptor = new StringBuilder();
-            formattedDescriptor.append(name).append("(");
-
-            for (int i = 0; i < argumentTypes.length; i++) {
-                if (i > 0) {
-                    formattedDescriptor.append(", ");
-                }
-                formattedDescriptor.append(getSimpleTypeName(argumentTypes[i].getClassName()));
-            }
-
-            formattedDescriptor.append("): ").append(getSimpleTypeName(returnType.getClassName()));
-
-            return formattedDescriptor.toString();
-        } catch (Exception e) {
-            // If there's an error parsing the descriptor, return the original
-            return name + descriptor;
-        }
-    }
-
-    /**
-     * Formats a field name and descriptor for better readability.
-     *
-     * @param fieldNameAndDescriptor Field name and descriptor in the format "name:descriptor"
-     * @return Formatted field name and descriptor
-     */
-    private static String formatField(String fieldNameAndDescriptor) {
-        int descriptorStart = fieldNameAndDescriptor.indexOf(':');
-        if (descriptorStart == -1) {
-            return fieldNameAndDescriptor;
-        }
-
-        String name = fieldNameAndDescriptor.substring(0, descriptorStart);
-        String descriptor = fieldNameAndDescriptor.substring(descriptorStart + 1);
-
-        // Try to convert the descriptor to a more readable format
-        try {
-            Type fieldType = Type.getType(descriptor);
-            return name + ": " + getSimpleTypeName(fieldType.getClassName());
-        } catch (Exception e) {
-            // If there's an error parsing the descriptor, return the original
-            return name + ": " + descriptor;
-        }
-    }
-
-    /**
-     * Gets the simple name of a class (without package).
-     *
-     * @param className Fully qualified class name
-     * @return Simple class name
-     */
-    private static String getSimpleTypeName(String className) {
-        int lastDot = className.lastIndexOf('.');
-        if (lastDot == -1) {
-            return className;
-        }
-        return className.substring(lastDot + 1);
-    }
-
-    /**
-     * Formats a set of referencing classes for better readability.
-     *
-     * @param referencingClasses Set of referencing classes
-     * @return Formatted string of referencing classes
-     */
-    private static String formatReferencingClasses(Set<String> referencingClasses) {
-        if (referencingClasses.size() <= 3) {
-            return String.join(", ", referencingClasses);
-        } else {
-            return referencingClasses.size() + " classes including " + 
-                   String.join(", ", referencingClasses.stream().limit(3).toArray(String[]::new)) + ", ...";
+            // Display overall statistics
+            System.out.println("\nOverall Statistics:");
+            System.out.println("================================================================================");
+            System.out.println("Total classes: " + totalClasses);
+            System.out.println("Total methods: " + totalMethods + 
+                              " (Referenced: " + totalReferencedMethods + 
+                              ", Not referenced: " + (totalMethods - totalReferencedMethods) + ")");
+            System.out.println("Total fields: " + totalFields + 
+                              " (Referenced: " + totalReferencedFields + 
+                              ", Not referenced: " + (totalFields - totalReferencedFields) + ")");
         }
     }
 }
